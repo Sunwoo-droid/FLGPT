@@ -1,0 +1,23 @@
+{
+  "name": "flgpt",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "main": "src/main.js",
+  "scripts": {
+  "start": "electron src/main.js"
+},
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "electron": "^39.2.7",
+    "react": "^19.2.3",
+    "react-dom": "^19.2.3"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^5.1.2",
+    "electron-builder": "^26.0.12",
+    "vite": "^7.3.0"
+  }
+}
