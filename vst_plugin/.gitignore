@@ -1,0 +1,41 @@
+# Build directories
+build/
+Builds/
+*.xcodeproj/
+*.xcworkspace/
+*.sln
+*.vcxproj*
+*.suo
+*.user
+
+# JUCE
+JuceLibraryCode/
+*.jucer.bak
+
+# Compiled files
+*.o
+*.obj
+*.dylib
+*.dll
+*.so
+*.a
+*.lib
+
+# IDE files
+.vs/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+*.dSYM
+
+# Windows
+Thumbs.db
+*.pdb
+
+# Plugin output
+*.vst3
+
