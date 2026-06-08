@@ -1,230 +1,96 @@
-/*
-  ==============================================================================
-
-    MIDIGenerator.cpp
-    Created: [Date]
-    Author: FLGPT
-
-  ==============================================================================
-*/
-
 #include "MIDIGenerator.h"
 
-//==============================================================================
-MIDIGenerator::MIDIGenerator()
-{
-}
+static constexpr int PATTERN_STEPS = 16;
 
-MIDIGenerator::~MIDIGenerator()
+void MIDIGenerator::processBlock(juce::MidiBuffer& midi,
+                                  double ppqPosition,
+                                  double bpm,
+                                  int numSamples,
+                                  double sampleRate,
+                                  const SessionState& state)
 {
-}
+    const auto& beat = state.getBeat();
+    if (!beat.isLoaded || beat.instruments.isEmpty() || numSamples <= 0) return;
 
-//==============================================================================
-void MIDIGenerator::generateMIDIEvents(juce::MidiBuffer& midiBuffer,
-                                        int64_t startSample,
-                                        int numSamples,
-                                        double sampleRate,
-                                        const SessionState& sessionState)
-{
-    const auto& beat = sessionState.getCurrentBeat();
-    
-    // Generate MIDI for each instrument
-    for (int i = 0; i < beat.instruments.size(); ++i)
+    if (bpm <= 0.0) bpm = (double)beat.tempo;
+    if (bpm <= 0.0) bpm = 120.0;
+
+    // Samples per 16th note
+    const double samplesPerBeat = sampleRate * 60.0 / bpm;
+    const double samplesPerStep = samplesPerBeat / 4.0;
+    const int    noteDuration   = juce::jmax(1, (int)(samplesPerStep * 0.45));
+
+    // ppqPosition is in quarter notes; multiply by 4 for 16th-note steps.
+    // The pattern loops every PATTERN_STEPS (16) steps = one bar.
+    const double globalStepStart = ppqPosition * 4.0;
+    const double stepsInBlock    = (double)numSamples / samplesPerStep;
+
+    // Steps whose downbeat falls inside this block (epsilon handles floating-point edge)
+    const int firstStep = (int)std::ceil(globalStepStart - 1e-9);
+    const int lastStep  = (int)std::ceil(globalStepStart + stepsInBlock - 1e-9);
+
+    for (int step = firstStep; step < lastStep; ++step)
     {
-        const auto& instrument = beat.instruments[i];
-        int midiChannel = getMIDIChannelForInstrument(instrument.name, i);
-        
-        generateInstrumentMIDI(midiBuffer,
-                              instrument,
-                              midiChannel,
-                              startSample,
-                              numSamples,
-                              sampleRate,
-                              beat.tempo);
-    }
-}
+        const int patternStep = ((step % PATTERN_STEPS) + PATTERN_STEPS) % PATTERN_STEPS;
 
-//==============================================================================
-int MIDIGenerator::noteNameToMIDI(const juce::String& noteName)
-{
-    int noteNumber = getNoteNumber(noteName);
-    int octave = getOctave(noteName);
-    
-    // MIDI note = 12 + (octave * 12) + noteNumber
-    int midiNote = 12 + (octave * 12) + noteNumber;
-    
-    // Clamp to valid MIDI range (0-127)
-    return juce::jlimit(0, 127, midiNote);
-}
+        const double stepOffsetSamples = (step - globalStepStart) * samplesPerStep;
+        const int sampleOn  = juce::jlimit(0, numSamples - 1, (int)stepOffsetSamples);
+        const int sampleOff = juce::jlimit(sampleOn, numSamples - 1, sampleOn + noteDuration);
 
-//==============================================================================
-int MIDIGenerator::getMIDIChannelForInstrument(const juce::String& instrumentName, int instrumentIndex)
-{
-    // Drums use channel 10 (MIDI channel 9, 0-indexed)
-    if (isDrumInstrument(instrumentName))
-        return 9;
-    
-    // Other instruments use channels 0-8, 11-15 (avoiding channel 10)
-    if (instrumentIndex < 9)
-        return instrumentIndex;
-    else
-        return instrumentIndex + 1; // Skip channel 10
-}
-
-//==============================================================================
-int MIDIGenerator::getNoteNumber(const juce::String& noteName)
-{
-    juce::String note = noteName.trim();
-    
-    // Extract note letter (C, D, E, F, G, A, B)
-    if (note.length() < 1)
-        return 0;
-    
-    juce::String letter = note.substring(0, 1).toUpperCase();
-    
-    // Map note letters to semitone offsets
-    int baseNote = 0;
-    if (letter == "C") baseNote = 0;
-    else if (letter == "D") baseNote = 2;
-    else if (letter == "E") baseNote = 4;
-    else if (letter == "F") baseNote = 5;
-    else if (letter == "G") baseNote = 7;
-    else if (letter == "A") baseNote = 9;
-    else if (letter == "B") baseNote = 11;
-    else return 0;
-    
-    // Check for sharp/flat
-    if (note.length() >= 2)
-    {
-        juce::String secondChar = note.substring(1, 2);
-        if (secondChar == "#" || secondChar == "s")
-            baseNote += 1;
-        else if (secondChar == "b" || secondChar == "f")
-            baseNote -= 1;
-    }
-    
-    // Handle enharmonic equivalents
-    if (note.contains("Db")) baseNote = 1;
-    else if (note.contains("Eb")) baseNote = 3;
-    else if (note.contains("Gb")) baseNote = 6;
-    else if (note.contains("Ab")) baseNote = 8;
-    else if (note.contains("Bb")) baseNote = 10;
-    
-    return baseNote % 12;
-}
-
-//==============================================================================
-int MIDIGenerator::getOctave(const juce::String& noteName)
-{
-    // Extract octave number (should be at the end)
-    for (int i = noteName.length() - 1; i >= 0; --i)
-    {
-        if (juce::CharacterFunctions::isDigit(noteName[i]))
+        for (int i = 0; i < beat.instruments.size(); ++i)
         {
-            juce::String octaveStr;
-            int j = i;
-            while (j >= 0 && juce::CharacterFunctions::isDigit(noteName[j]))
-            {
-                octaveStr = noteName.substring(j, j + 1) + octaveStr;
-                --j;
-            }
-            return octaveStr.getIntValue();
-        }
-    }
-    
-    return 2; // Default to octave 2
-}
+            const auto& inst = beat.instruments[i];
+            if (patternStep >= inst.pattern.size()) continue;
+            if (inst.pattern[patternStep] == 0)     continue;
+            if (inst.notes.isEmpty())               continue;
 
-//==============================================================================
-bool MIDIGenerator::isDrumInstrument(const juce::String& instrumentName)
-{
-    juce::String name = instrumentName.toLowerCase();
-    
-    return name.contains("kick") ||
-           name.contains("snare") ||
-           name.contains("hi-hat") ||
-           name.contains("hihat") ||
-           name.contains("crash") ||
-           name.contains("tom") ||
-           name.contains("cymbal") ||
-           name.contains("drum");
-}
+            const int channel = isDrum(inst.name) ? 10 : juce::jlimit(1, 9, i + 1);
+            const int noteNum = juce::jlimit(0, 127, noteNameToMidi(inst.notes[0]));
+            const auto vel    = (uint8_t)juce::jlimit(1, 127, inst.velocity);
 
-//==============================================================================
-void MIDIGenerator::generateInstrumentMIDI(juce::MidiBuffer& midiBuffer,
-                                            const SessionState::Instrument& instrument,
-                                            int midiChannel,
-                                            int64_t startSample,
-                                            int numSamples,
-                                            double sampleRate,
-                                            int tempo)
-{
-    // Calculate samples per 16th note
-    // tempo BPM = beats per minute
-    // 1 beat = quarter note
-    // 1 quarter note = 4 sixteenth notes
-    // samples per 16th = (sampleRate * 60) / (tempo * 4)
-    double samplesPerSixteenth = (sampleRate * 60.0) / (tempo * 4.0);
-    
-    // Generate MIDI events for each pattern step
-    // We need to handle looping - calculate which pattern cycle we're in
-    int patternLength = instrument.pattern.size();
-    if (patternLength == 0)
-        return;
-    
-    // Calculate how many complete pattern cycles fit in the buffer range
-    double patternLengthInSamples = patternLength * samplesPerSixteenth;
-    
-    // Find the first pattern cycle that overlaps with our buffer
-    int64_t firstCycleStart = (startSample / static_cast<int64_t>(patternLengthInSamples)) * static_cast<int64_t>(patternLengthInSamples);
-    
-    // Generate events for all overlapping cycles
-    for (int64_t cycleStart = firstCycleStart; cycleStart < (startSample + numSamples); cycleStart += static_cast<int64_t>(patternLengthInSamples))
-    {
-        for (int step = 0; step < patternLength; ++step)
-        {
-            if (instrument.pattern[step] == 1) // Hit at this step
-            {
-                // Calculate sample position for this step in this cycle
-                int64_t stepSample = cycleStart + static_cast<int64_t>(step * samplesPerSixteenth);
-                
-                // Check if this step falls within the current buffer range
-                if (stepSample >= startSample && stepSample < (startSample + numSamples))
-                {
-                    // Get note number
-                    int noteIndex = step % instrument.notes.size();
-                    if (noteIndex < 0 || noteIndex >= instrument.notes.size())
-                        noteIndex = 0;
-                    juce::String noteName = instrument.notes[noteIndex];
-                    int midiNote = noteNameToMIDI(noteName);
-                    
-                    // Calculate position relative to buffer start
-                    int bufferPosition = static_cast<int>(stepSample - startSample);
-                    bufferPosition = juce::jlimit(0, numSamples - 1, bufferPosition);
-                    
-                    // Add note on event
-                    juce::MidiMessage noteOn = juce::MidiMessage::noteOn(midiChannel + 1, midiNote, 
-                                                                          static_cast<juce::uint8>(juce::jlimit(1, 127, instrument.velocity)));
-                    midiBuffer.addEvent(noteOn, bufferPosition);
-                    
-                    // Add note off event (after 1/16th note duration)
-                    int noteOffPosition = static_cast<int>(bufferPosition + samplesPerSixteenth);
-                    noteOffPosition = juce::jlimit(0, numSamples - 1, noteOffPosition);
-                    if (noteOffPosition > bufferPosition)
-                    {
-                        juce::MidiMessage noteOff = juce::MidiMessage::noteOff(midiChannel + 1, midiNote);
-                        midiBuffer.addEvent(noteOff, noteOffPosition);
-                    }
-                }
-            }
+            midi.addEvent(juce::MidiMessage::noteOn (channel, noteNum, vel),        sampleOn);
+            midi.addEvent(juce::MidiMessage::noteOff(channel, noteNum, (uint8_t)0), sampleOff);
         }
     }
 }
 
-//==============================================================================
-int64_t MIDIGenerator::stepToSample(int step, double sampleRate, int tempo) const
+bool MIDIGenerator::isDrum(const juce::String& name)
 {
-    double samplesPerSixteenth = (sampleRate * 60.0) / (tempo * 4.0);
-    return static_cast<int64_t>(step * samplesPerSixteenth);
+    const juce::String lower = name.toLowerCase();
+    return lower.contains("kick")  || lower.contains("snare") ||
+           lower.contains("hat")   || lower.contains("cymbal") ||
+           lower.contains("drum")  || lower.contains("perc")   ||
+           lower.contains("clap")  || lower.contains("tom")    ||
+           lower.contains("rim")   || lower.contains("crash")  ||
+           lower.contains("ride");
 }
 
+int MIDIGenerator::noteNameToMidi(const juce::String& noteName)
+{
+    if (noteName.isEmpty()) return 60;
+
+    static const struct { const char* name; int semitone; } noteTable[] = {
+        {"C#", 1}, {"Db", 1}, {"D#", 3}, {"Eb", 3}, {"F#", 6}, {"Gb", 6},
+        {"G#", 8}, {"Ab", 8}, {"A#", 10}, {"Bb", 10},
+        {"C", 0}, {"D", 2}, {"E", 4}, {"F", 5},
+        {"G", 7}, {"A", 9}, {"B", 11}
+    };
+
+    const juce::String upper = noteName.toUpperCase();
+    int semitone = -1, charsConsumed = 0;
+
+    for (auto& entry : noteTable)
+    {
+        const juce::String key = juce::String(entry.name).toUpperCase();
+        if (upper.startsWith(key) && key.length() > charsConsumed)
+        {
+            semitone      = entry.semitone;
+            charsConsumed = key.length();
+        }
+    }
+
+    if (semitone < 0 || charsConsumed == 0) return 60;
+
+    const int octave = noteName.substring(charsConsumed).getIntValue();
+    return juce::jlimit(0, 127, (octave + 1) * 12 + semitone);
+}

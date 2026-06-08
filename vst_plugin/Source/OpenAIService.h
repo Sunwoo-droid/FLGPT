@@ -1,44 +1,40 @@
-/*
-  ==============================================================================
-
-    OpenAIService.h
-    Created: [Date]
-    Author: FLGPT
-
-  ==============================================================================
-*/
-
 #pragma once
 
-#include "LLMService.h"
+#include <juce_core/juce_core.h>
+#include "SessionState.h"
 
-//==============================================================================
-/**
-    OpenAI API implementation for GPT models.
-*/
-class OpenAIService : public LLMService
+class OpenAIService
 {
 public:
-    //==============================================================================
-    OpenAIService();
-    ~OpenAIService() override;
-    
-    //==============================================================================
-    BeatGenerationResult generateBeat(const juce::String& prompt) override;
-    ComponentAdjustmentResult adjustComponent(const juce::String& componentName,
-                                               const juce::String& adjustmentPrompt,
-                                               const juce::var& currentBeat) override;
-    ChatResult chat(const juce::String& message,
-                   const juce::Array<juce::var>& conversationHistory = {}) override;
+    struct Response
+    {
+        bool success = false;
+        juce::String message;
+        // "generate_beat" | "update_component" | "none"
+        juce::String action;
+        SessionState::Beat beat;
+        juce::String componentName;
+        SessionState::Instrument component;
+        juce::String error;
+    };
+
+    void setApiKey(const juce::String& key) { apiKey = key; }
+    const juce::String& getApiKey() const   { return apiKey; }
+    bool hasApiKey() const                  { return apiKey.isNotEmpty(); }
+
+    // One call handles everything: new beats, component edits, and conversation.
+    // The LLM decides which action to take based on the user message + current beat context.
+    Response sendMessage(const juce::String& userMessage,
+                         const SessionState::Beat& currentBeat);
 
 private:
-    //==============================================================================
-    static constexpr const char* API_URL = "https://api.openai.com/v1/chat/completions";
-    
-    juce::StringPairArray createHeaders();
-    juce::var createChatRequest(const juce::Array<juce::var>& messages, bool useJSONMode = false);
-    juce::String getSystemPromptForBeatGeneration();
-    juce::String getSystemPromptForComponentAdjustment();
-    juce::String getSystemPromptForChat();
-};
+    juce::String apiKey;
+    juce::String model = "gpt-4o-mini";
 
+    static constexpr const char* API_URL = "https://api.openai.com/v1/chat/completions";
+
+    juce::String buildSystemPrompt() const;
+    juce::String beatToJson(const SessionState::Beat& beat) const;
+    SessionState::Beat       parseBeat(const juce::var& obj) const;
+    SessionState::Instrument parseInstrument(const juce::var& obj) const;
+};

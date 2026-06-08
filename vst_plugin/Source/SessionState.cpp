@@ -1,301 +1,106 @@
-/*
-  ==============================================================================
-
-    SessionState.cpp
-    Created: [Date]
-    Author: FLGPT
-
-  ==============================================================================
-*/
-
 #include "SessionState.h"
 
-//==============================================================================
-SessionState::SessionState()
+void SessionState::updateBeat(const Beat& newBeat)
 {
+    beat = newBeat;
+    beat.isLoaded = true;
+    listeners.call([](Listener& l) { l.beatChanged(); });
 }
 
-SessionState::~SessionState()
+void SessionState::updateComponent(const juce::String& name, const Instrument& updated)
 {
-}
-
-//==============================================================================
-void SessionState::updateFromBeatData(const juce::var& jsonData)
-{
-    if (!jsonData.isObject())
-        return;
-    
-    auto* obj = jsonData.getDynamicObject();
-    if (obj == nullptr)
-        return;
-    
-    // Parse tempo
-    if (obj->hasProperty("tempo"))
-        currentBeat.tempo = static_cast<int>(obj->getProperty("tempo"));
-    
-    // Parse time signature
-    if (obj->hasProperty("timeSignature"))
-        currentBeat.timeSignature = obj->getProperty("timeSignature").toString();
-    
-    // Parse key
-    if (obj->hasProperty("key"))
-        currentBeat.key = obj->getProperty("key").toString();
-    
-    // Parse style
-    if (obj->hasProperty("style"))
-        currentBeat.style = obj->getProperty("style").toString();
-    
-    // Parse description
-    if (obj->hasProperty("description"))
-        currentBeat.description = obj->getProperty("description").toString();
-    
-    // Parse instruments
-    currentBeat.instruments.clear();
-    if (obj->hasProperty("instruments"))
+    for (auto& inst : beat.instruments)
     {
-        auto instrumentsVar = obj->getProperty("instruments");
-        if (instrumentsVar.isArray())
+        if (inst.name.equalsIgnoreCase(name))
         {
-            auto* instrumentsArray = instrumentsVar.getArray();
-            for (auto& instrumentVar : *instrumentsArray)
-            {
-                currentBeat.instruments.add(parseInstrument(instrumentVar));
-            }
-        }
-    }
-    
-    notifyBeatDataChanged();
-}
-
-//==============================================================================
-void SessionState::updateComponent(const juce::String& componentName, const juce::var& componentData)
-{
-    auto* instrument = findInstrument(componentName);
-    
-    if (instrument != nullptr)
-    {
-        // Update existing component
-        *instrument = parseInstrument(componentData);
-    }
-    else
-    {
-        // Add new component
-        addComponent(parseInstrument(componentData));
-    }
-    
-    notifyComponentUpdated(componentName);
-}
-
-//==============================================================================
-void SessionState::addComponent(const Instrument& instrument)
-{
-    currentBeat.instruments.add(instrument);
-    notifyBeatDataChanged();
-}
-
-//==============================================================================
-void SessionState::removeComponent(const juce::String& componentName)
-{
-    for (int i = currentBeat.instruments.size() - 1; i >= 0; --i)
-    {
-        if (currentBeat.instruments[i].name == componentName)
-        {
-            currentBeat.instruments.remove(i);
-            notifyBeatDataChanged();
+            inst = updated;
+            listeners.call([](Listener& l) { l.beatChanged(); });
             return;
         }
     }
+    beat.instruments.add(updated);
+    listeners.call([](Listener& l) { l.beatChanged(); });
 }
 
-//==============================================================================
-SessionState::Instrument* SessionState::findInstrument(const juce::String& name)
+void SessionState::addListener(Listener* l)   { listeners.add(l); }
+void SessionState::removeListener(Listener* l) { listeners.remove(l); }
+
+void SessionState::saveState(juce::OutputStream& out)
 {
-    for (auto& instrument : currentBeat.instruments)
+    juce::DynamicObject::Ptr root = new juce::DynamicObject();
+    root->setProperty("tempo", beat.tempo);
+    root->setProperty("key", beat.key);
+    root->setProperty("style", beat.style);
+    root->setProperty("isLoaded", beat.isLoaded);
+
+    juce::Array<juce::var> instruments;
+    for (const auto& inst : beat.instruments)
     {
-        if (instrument.name == name)
-            return &instrument;
+        juce::DynamicObject::Ptr obj = new juce::DynamicObject();
+        obj->setProperty("name", inst.name);
+        obj->setProperty("velocity", inst.velocity);
+
+        juce::Array<juce::var> pattern;
+        for (auto p : inst.pattern) pattern.add(p);
+        obj->setProperty("pattern", juce::var(pattern));
+
+        juce::Array<juce::var> notes;
+        for (const auto& n : inst.notes) notes.add(n);
+        obj->setProperty("notes", juce::var(notes));
+
+        instruments.add(juce::var(obj.get()));
     }
-    return nullptr;
+    root->setProperty("instruments", juce::var(instruments));
+
+    juce::String json = juce::JSON::toString(juce::var(root.get()));
+    out.writeString(json);
 }
 
-//==============================================================================
-const SessionState::Instrument* SessionState::findInstrument(const juce::String& name) const
+void SessionState::loadState(juce::InputStream& in)
 {
-    for (const auto& instrument : currentBeat.instruments)
+    juce::String json = in.readString();
+    if (json.isEmpty()) return;
+
+    juce::var data = juce::JSON::parse(json);
+    if (!data.isObject()) return;
+
+    auto* root = data.getDynamicObject();
+    if (!root) return;
+
+    Beat loaded;
+    loaded.tempo    = (int)root->getProperty("tempo");
+    loaded.key      = root->getProperty("key").toString();
+    loaded.style    = root->getProperty("style").toString();
+    loaded.isLoaded = (bool)root->getProperty("isLoaded");
+    if (loaded.tempo <= 0) loaded.tempo = 120;
+
+    auto instArray = root->getProperty("instruments");
+    if (instArray.isArray())
     {
-        if (instrument.name == name)
-            return &instrument;
-    }
-    return nullptr;
-}
-
-//==============================================================================
-SessionState::Instrument SessionState::parseInstrument(const juce::var& instrumentData)
-{
-    Instrument instrument;
-    
-    if (!instrumentData.isObject())
-        return instrument;
-    
-    auto* obj = instrumentData.getDynamicObject();
-    if (obj == nullptr)
-        return instrument;
-    
-    // Parse name
-    if (obj->hasProperty("name"))
-        instrument.name = obj->getProperty("name").toString();
-    
-    // Parse pattern
-    if (obj->hasProperty("pattern"))
-        instrument.pattern = parsePattern(obj->getProperty("pattern"));
-    
-    // Parse notes
-    if (obj->hasProperty("notes"))
-        instrument.notes = parseNotes(obj->getProperty("notes"));
-    
-    // Parse velocity
-    if (obj->hasProperty("velocity"))
-        instrument.velocity = static_cast<int>(obj->getProperty("velocity"));
-    
-    return instrument;
-}
-
-//==============================================================================
-juce::Array<int> SessionState::parsePattern(const juce::var& patternData)
-{
-    juce::Array<int> pattern;
-    
-    if (patternData.isArray())
-    {
-        auto* array = patternData.getArray();
-        for (auto& value : *array)
+        for (const auto& instVar : *instArray.getArray())
         {
-            pattern.add(static_cast<int>(value));
+            if (!instVar.isObject()) continue;
+            auto* obj = instVar.getDynamicObject();
+            if (!obj) continue;
+
+            Instrument inst;
+            inst.name     = obj->getProperty("name").toString();
+            inst.velocity = (int)obj->getProperty("velocity");
+            if (inst.velocity <= 0) inst.velocity = 80;
+
+            auto patVar = obj->getProperty("pattern");
+            if (patVar.isArray())
+                for (const auto& p : *patVar.getArray())
+                    inst.pattern.add((int)p);
+
+            auto notesVar = obj->getProperty("notes");
+            if (notesVar.isArray())
+                for (const auto& n : *notesVar.getArray())
+                    inst.notes.add(n.toString());
+
+            loaded.instruments.add(inst);
         }
     }
-    
-    return pattern;
-}
 
-//==============================================================================
-juce::Array<juce::String> SessionState::parseNotes(const juce::var& notesData)
-{
-    juce::Array<juce::String> notes;
-    
-    if (notesData.isArray())
-    {
-        auto* array = notesData.getArray();
-        for (auto& value : *array)
-        {
-            notes.add(value.toString());
-        }
-    }
-    
-    return notes;
+    beat = loaded;
 }
-
-//==============================================================================
-void SessionState::saveState(juce::OutputStream& stream)
-{
-    juce::MemoryOutputStream mos;
-    
-    // Write tempo
-    mos.writeInt(currentBeat.tempo);
-    
-    // Write time signature
-    mos.writeString(currentBeat.timeSignature);
-    
-    // Write key
-    mos.writeString(currentBeat.key);
-    
-    // Write style
-    mos.writeString(currentBeat.style);
-    
-    // Write description
-    mos.writeString(currentBeat.description);
-    
-    // Write instruments
-    mos.writeInt(currentBeat.instruments.size());
-    for (const auto& instrument : currentBeat.instruments)
-    {
-        mos.writeString(instrument.name);
-        mos.writeInt(instrument.pattern.size());
-        for (auto patternValue : instrument.pattern)
-            mos.writeInt(patternValue);
-        mos.writeInt(instrument.notes.size());
-        for (const auto& note : instrument.notes)
-            mos.writeString(note);
-        mos.writeInt(instrument.velocity);
-    }
-    
-    stream.write(mos.getData(), mos.getDataSize());
-}
-
-//==============================================================================
-void SessionState::loadState(juce::InputStream& stream)
-{
-    // Read tempo
-    currentBeat.tempo = stream.readInt();
-    
-    // Read time signature
-    currentBeat.timeSignature = stream.readString();
-    
-    // Read key
-    currentBeat.key = stream.readString();
-    
-    // Read style
-    currentBeat.style = stream.readString();
-    
-    // Read description
-    currentBeat.description = stream.readString();
-    
-    // Read instruments
-    currentBeat.instruments.clear();
-    int numInstruments = stream.readInt();
-    for (int i = 0; i < numInstruments; ++i)
-    {
-        Instrument instrument;
-        instrument.name = stream.readString();
-        
-        int patternSize = stream.readInt();
-        instrument.pattern.clear();
-        for (int j = 0; j < patternSize; ++j)
-            instrument.pattern.add(stream.readInt());
-        
-        int notesSize = stream.readInt();
-        instrument.notes.clear();
-        for (int j = 0; j < notesSize; ++j)
-            instrument.notes.add(stream.readString());
-        
-        instrument.velocity = stream.readInt();
-        
-        currentBeat.instruments.add(instrument);
-    }
-    
-    notifyBeatDataChanged();
-}
-
-//==============================================================================
-void SessionState::addListener(Listener* listener)
-{
-    listeners.add(listener);
-}
-
-//==============================================================================
-void SessionState::removeListener(Listener* listener)
-{
-    listeners.remove(listener);
-}
-
-//==============================================================================
-void SessionState::notifyBeatDataChanged()
-{
-    listeners.call([](Listener& l) { l.beatDataChanged(); });
-}
-
-//==============================================================================
-void SessionState::notifyComponentUpdated(const juce::String& componentName)
-{
-    listeners.call([componentName](Listener& l) { l.componentUpdated(componentName); });
-}
-

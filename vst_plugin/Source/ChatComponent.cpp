@@ -1,480 +1,197 @@
-/*
-  ==============================================================================
-
-    ChatComponent.cpp
-    Created: [Date]
-    Author: FLGPT
-
-  ==============================================================================
-*/
-
 #include "ChatComponent.h"
+
+// Background thread that calls OpenAI and then posts the result back to the message thread.
+// Uses SafePointer so that if ChatComponent is destroyed while the thread is running,
+// the async callback safely no-ops instead of accessing freed memory.
+struct ChatComponent::LLMThread : public juce::Thread
+{
+    LLMThread(ChatComponent* owner,
+              const juce::String& msg,
+              const SessionState::Beat& beat)
+        : juce::Thread("FLGPT-LLM"), owner(owner), userMessage(msg), currentBeat(beat) {}
+
+    void run() override
+    {
+        if (!owner || !owner->service) return;
+
+        auto result = owner->service->sendMessage(userMessage, currentBeat);
+
+        juce::Component::SafePointer<ChatComponent> safeOwner(owner);
+        juce::MessageManager::callAsync([safeOwner, result]()
+        {
+            if (safeOwner == nullptr) return;
+            safeOwner->handleLLMResult(result);
+        });
+    }
+
+    ChatComponent*       owner;
+    juce::String         userMessage;
+    SessionState::Beat   currentBeat;
+};
 
 //==============================================================================
 ChatComponent::ChatComponent()
 {
-    // Setup input field
+    // Chat log: read-only TextEditor handles display + scrolling
+    chatLog.setMultiLine(true);
+    chatLog.setReadOnly(true);
+    chatLog.setScrollbarsShown(true);
+    chatLog.setFont(juce::Font(juce::FontOptions(13.0f)));
+    chatLog.setColour(juce::TextEditor::backgroundColourId,      juce::Colour(0xff1e1e1e));
+    chatLog.setColour(juce::TextEditor::textColourId,            juce::Colour(0xffd4d4d4));
+    chatLog.setColour(juce::TextEditor::outlineColourId,         juce::Colour(0xff333333));
+    chatLog.setColour(juce::TextEditor::focusedOutlineColourId,  juce::Colour(0xff333333));
+    addAndMakeVisible(chatLog);
+
+    // Input field
     inputField.setMultiLine(false);
     inputField.setReturnKeyStartsNewLine(false);
-    inputField.setFont(juce::Font(juce::FontOptions(14.0f)));
-    inputField.setColour(juce::TextEditor::backgroundColourId, juce::Colour(0xff2a2a2a));
-    inputField.setColour(juce::TextEditor::textColourId, juce::Colour(0xffffffff));
-    inputField.setColour(juce::TextEditor::outlineColourId, juce::Colour(0xff444444));
+    inputField.setFont(juce::Font(juce::FontOptions(13.0f)));
+    inputField.setColour(juce::TextEditor::backgroundColourId,     juce::Colour(0xff2d2d2d));
+    inputField.setColour(juce::TextEditor::textColourId,           juce::Colours::white);
+    inputField.setColour(juce::TextEditor::outlineColourId,        juce::Colour(0xff555555));
     inputField.setColour(juce::TextEditor::focusedOutlineColourId, juce::Colour(0xff4a9eff));
     inputField.addListener(this);
     addAndMakeVisible(inputField);
-    
-    // Setup send button
-    sendButton.setButtonText("Send");
+
+    sendButton.setColour(juce::TextButton::buttonColourId,  juce::Colour(0xff4a9eff));
+    sendButton.setColour(juce::TextButton::textColourOffId, juce::Colours::white);
     sendButton.addListener(this);
-    sendButton.setColour(juce::TextButton::buttonColourId, juce::Colour(0xff4a9eff));
-    sendButton.setColour(juce::TextButton::textColourOffId, juce::Colour(0xffffffff));
     addAndMakeVisible(sendButton);
-    
-    // Setup settings button
-    settingsButton.setButtonText("Settings");
+
+    settingsButton.setColour(juce::TextButton::buttonColourId,  juce::Colour(0xff3a3a3a));
+    settingsButton.setColour(juce::TextButton::textColourOffId, juce::Colour(0xffaaaaaa));
     settingsButton.addListener(this);
-    settingsButton.setColour(juce::TextButton::buttonColourId, juce::Colour(0xff6c757d));
-    settingsButton.setColour(juce::TextButton::textColourOffId, juce::Colour(0xffffffff));
     addAndMakeVisible(settingsButton);
-    
-    // Setup chat viewport
-    chatViewport.setViewedComponent(&chatContent, false);
-    chatViewport.setScrollBarsShown(true, false);
-    addAndMakeVisible(chatViewport);
-    
-    // Initial welcome message
-    addMessage("Welcome to FLGPT! Try asking me to create a beat, or ask a music production question.", false);
+
+    appendMessage("FLGPT", "Welcome! Describe the beat you want.\n"
+                            "Example: \"Create a chill lo-fi beat at 85 BPM\"\n"
+                            "Or after a beat is loaded: \"Make the hi-hats more aggressive\"");
 }
 
 ChatComponent::~ChatComponent()
 {
-    if (sessionState != nullptr)
-        sessionState->removeListener(this);
-    
-    if (llmThread != nullptr && llmThread->isThreadRunning())
-    {
-        llmThread->stopThread(5000);
-    }
+    if (sessionState) sessionState->removeListener(this);
+    if (llmThread) llmThread->stopThread(3000);
+}
+
+void ChatComponent::setSessionState(SessionState* state)
+{
+    if (sessionState) sessionState->removeListener(this);
+    sessionState = state;
+    if (sessionState) sessionState->addListener(this);
 }
 
 //==============================================================================
 void ChatComponent::paint(juce::Graphics& g)
 {
     g.fillAll(juce::Colour(0xff1a1a1a));
-    
-    // Draw chat area background
-    g.setColour(juce::Colour(0xff252525));
-    g.fillRect(chatViewport.getBounds());
-    
-    // Draw messages
-    int y = 10;
-    int width = chatContent.getWidth() - 20;
-    
-    for (const auto& message : messages)
-    {
-        int height = calculateMessageHeight(message, width);
-        drawMessage(g, message, y, width);
-        y += height + 10;
-    }
-    
-    // Update content height
-    chatContent.setSize(chatContent.getWidth(), y + 10);
 }
 
-//==============================================================================
 void ChatComponent::resized()
 {
-    auto bounds = getLocalBounds();
-    
-    // Settings button (top right)
-    settingsButton.setBounds(bounds.removeFromTop(30).removeFromRight(100).reduced(5));
-    
-    // Chat viewport (main area)
-    chatViewport.setBounds(bounds.removeFromTop(bounds.getHeight() - 50));
-    chatContent.setSize(chatViewport.getWidth() - 20, chatContent.getHeight());
-    
-    // Input area (bottom)
-    auto inputArea = bounds.reduced(5);
-    sendButton.setBounds(inputArea.removeFromRight(80));
-    inputArea.removeFromRight(5);
-    inputField.setBounds(inputArea);
+    auto b = getLocalBounds().reduced(8);
+
+    // Settings button top-right
+    auto topRow = b.removeFromTop(30);
+    settingsButton.setBounds(topRow.removeFromRight(90).reduced(0, 2));
+    b.removeFromTop(6);
+
+    // Input row at bottom
+    auto inputRow = b.removeFromBottom(34);
+    sendButton.setBounds(inputRow.removeFromRight(70));
+    inputRow.removeFromRight(6);
+    inputField.setBounds(inputRow);
+    b.removeFromBottom(6);
+
+    chatLog.setBounds(b);
 }
 
-//==============================================================================
-void ChatComponent::buttonClicked(juce::Button* button)
+void ChatComponent::buttonClicked(juce::Button* btn)
 {
-    if (button == &sendButton)
-    {
+    if (btn == &sendButton)
         sendMessage();
-    }
-    else if (button == &settingsButton)
-    {
-        // TODO: Open settings dialog
-        addMessage("Settings dialog coming soon!", false);
-    }
+    else if (btn == &settingsButton && onSettingsClicked)
+        onSettingsClicked();
 }
 
-//==============================================================================
-void ChatComponent::textEditorReturnKeyPressed(juce::TextEditor& editor)
+void ChatComponent::textEditorReturnKeyPressed(juce::TextEditor& ed)
 {
-    if (&editor == &inputField)
-    {
-        sendMessage();
-    }
+    if (&ed == &inputField) sendMessage();
 }
 
-//==============================================================================
-void ChatComponent::beatDataChanged()
+void ChatComponent::beatChanged()
 {
-    if (sessionState != nullptr)
-    {
-        displayBeatInfo(sessionState->getCurrentBeat());
-    }
-    updateChatDisplay();
-}
+    if (!sessionState) return;
+    const auto& beat = sessionState->getBeat();
 
-//==============================================================================
-void ChatComponent::componentUpdated(const juce::String& componentName)
-{
-    addMessage("Component '" + componentName + "' has been updated.", false);
-    updateChatDisplay();
-}
-
-//==============================================================================
-void ChatComponent::setLLMService(LLMService* service)
-{
-    llmService = service;
-}
-
-//==============================================================================
-void ChatComponent::setSessionState(SessionState* state)
-{
-    if (sessionState != nullptr)
-        sessionState->removeListener(this);
-    
-    sessionState = state;
-    
-    if (sessionState != nullptr)
-        sessionState->addListener(this);
-}
-
-//==============================================================================
-void ChatComponent::sendMessage()
-{
-    juce::String message = inputField.getText().trim();
-    if (message.isEmpty() || isLoading)
-        return;
-    
-    inputField.setText("");
-    addMessage(message, true);
-    
-    // Determine message type and handle accordingly
-    if (isBeatRequest(message))
-    {
-        handleBeatGeneration(message);
-    }
-    else
-    {
-        handleGeneralChat(message);
-    }
-}
-
-//==============================================================================
-void ChatComponent::addMessage(const juce::String& text, bool isUser)
-{
-    ChatMessage msg;
-    msg.text = text;
-    msg.isUser = isUser;
-    msg.timestamp = juce::Time::getCurrentTime();
-    
-    messages.add(msg);
-    
-    // Add to conversation history for LLM
-    if (llmService != nullptr)
-    {
-        juce::DynamicObject::Ptr msgObj = new juce::DynamicObject();
-        msgObj->setProperty("role", isUser ? "user" : "assistant");
-        msgObj->setProperty("content", text);
-        conversationHistory.add(juce::var(msgObj.get()));
-    }
-    
-    updateChatDisplay();
-}
-
-//==============================================================================
-void ChatComponent::displayBeatInfo(const SessionState::BeatData& beat)
-{
-    juce::String info = "Beat Generated!\n\n";
-    info += "Tempo: " + juce::String(beat.tempo) + " BPM\n";
-    info += "Key: " + beat.key + "\n";
-    info += "Time Signature: " + beat.timeSignature + "\n";
-    info += "Style: " + beat.style + "\n\n";
-    info += "Instruments: ";
-    
+    juce::String info = "Beat ready: " + juce::String(beat.tempo) + " BPM";
+    if (beat.key.isNotEmpty())   info += ", " + beat.key;
+    if (beat.style.isNotEmpty()) info += " — " + beat.style;
+    info += ". Tracks: ";
     for (int i = 0; i < beat.instruments.size(); ++i)
     {
         if (i > 0) info += ", ";
         info += beat.instruments[i].name;
     }
-    
-    if (!beat.description.isEmpty())
-    {
-        info += "\n\n" + beat.description;
-    }
-    
-    addMessage(info, false);
+    info += ". Press Play in FL Studio to hear it.";
+    appendMessage("FLGPT", info);
 }
 
 //==============================================================================
-void ChatComponent::updateChatDisplay()
+void ChatComponent::sendMessage()
 {
-    chatContent.repaint();
-    chatViewport.setViewPositionProportionately(0.0, 1.0); // Scroll to bottom
-}
+    const juce::String text = inputField.getText().trim();
+    if (text.isEmpty() || isLoading) return;
 
-//==============================================================================
-void ChatComponent::handleBeatGeneration(const juce::String& prompt)
-{
-    if (llmService == nullptr)
+    inputField.setText({});
+    appendMessage("You", text);
+
+    if (!service || !service->hasApiKey())
     {
-        showError("LLM service not configured. Please set API key in settings.");
+        appendMessage("FLGPT", "Please add your OpenAI API key in Settings first.");
         return;
     }
-    
-    if (isLoading)
-        return;
-    
-    showLoading(true);
-    
-    // Create and start background thread
-    llmThread = std::make_unique<LLMThread>(this);
-    llmThread->prompt = prompt;
-    llmThread->requestType = 0;
+
+    SessionState::Beat currentBeat;
+    if (sessionState) currentBeat = sessionState->getBeat();
+
+    setLoading(true);
+    llmThread = std::make_unique<LLMThread>(this, text, currentBeat);
     llmThread->startThread();
 }
 
-//==============================================================================
-void ChatComponent::handleComponentAdjustment(const juce::String& componentName, const juce::String& adjustment)
+void ChatComponent::handleLLMResult(const OpenAIService::Response& result)
 {
-    if (llmService == nullptr || sessionState == nullptr)
+    setLoading(false);
+
+    if (!result.success)
     {
-        showError("Service or session state not available.");
+        appendMessage("FLGPT", "Error: " + result.error);
         return;
     }
-    
-    if (isLoading)
-        return;
-    
-    showLoading(true);
-    
-    juce::var currentBeat;
-    // Convert session state to JSON for LLM
-    auto& beat = sessionState->getCurrentBeat();
-    juce::DynamicObject::Ptr beatObj = new juce::DynamicObject();
-    beatObj->setProperty("tempo", beat.tempo);
-    beatObj->setProperty("timeSignature", beat.timeSignature);
-    beatObj->setProperty("key", beat.key);
-    beatObj->setProperty("style", beat.style);
-    
-    juce::Array<juce::var> instruments;
-    for (const auto& inst : beat.instruments)
-    {
-        juce::DynamicObject::Ptr instObj = new juce::DynamicObject();
-        instObj->setProperty("name", inst.name);
-        juce::Array<juce::var> pattern;
-        for (auto p : inst.pattern)
-            pattern.add(p);
-        instObj->setProperty("pattern", juce::var(pattern));
-        juce::Array<juce::var> notes;
-        for (const auto& n : inst.notes)
-            notes.add(n);
-        instObj->setProperty("notes", juce::var(notes));
-        instObj->setProperty("velocity", inst.velocity);
-        instruments.add(juce::var(instObj.get()));
-    }
-    beatObj->setProperty("instruments", juce::var(instruments));
-    currentBeat = juce::var(beatObj.get());
-    
-    // Create and start background thread
-    llmThread = std::make_unique<LLMThread>(this);
-    llmThread->componentName = componentName;
-    llmThread->adjustment = adjustment;
-    llmThread->currentBeat = currentBeat;
-    llmThread->requestType = 1;
-    llmThread->startThread();
+
+    if (result.message.isNotEmpty())
+        appendMessage("FLGPT", result.message);
+
+    if (result.action == "generate_beat" && sessionState)
+        sessionState->updateBeat(result.beat);
+    else if (result.action == "update_component" && sessionState)
+        sessionState->updateComponent(result.componentName, result.component);
 }
 
 //==============================================================================
-void ChatComponent::handleGeneralChat(const juce::String& message)
+void ChatComponent::appendMessage(const juce::String& speaker, const juce::String& text)
 {
-    if (llmService == nullptr)
-    {
-        showError("LLM service not configured. Please set API key in settings.");
-        return;
-    }
-    
-    if (isLoading)
-        return;
-    
-    showLoading(true);
-    
-    // Create and start background thread
-    llmThread = std::make_unique<LLMThread>(this);
-    llmThread->prompt = message;
-    llmThread->requestType = 2;
-    llmThread->startThread();
+    logText += speaker + ": " + text + "\n\n";
+    chatLog.setText(logText, false);
+    chatLog.moveCaretToEnd();
 }
 
-//==============================================================================
-bool ChatComponent::isBeatRequest(const juce::String& prompt)
+void ChatComponent::setLoading(bool loading)
 {
-    juce::String lower = prompt.toLowerCase();
-    return lower.contains("beat") ||
-           lower.contains("create") ||
-           lower.contains("make") ||
-           lower.contains("generate") ||
-           lower.contains("produce") ||
-           lower.contains("type of");
+    isLoading = loading;
+    sendButton.setEnabled(!loading);
+    inputField.setEnabled(!loading);
+    if (loading) appendMessage("FLGPT", "...");
 }
-
-//==============================================================================
-void ChatComponent::showError(const juce::String& errorMessage)
-{
-    addMessage("Error: " + errorMessage, false);
-}
-
-//==============================================================================
-void ChatComponent::showLoading(bool show)
-{
-    isLoading = show;
-    sendButton.setEnabled(!show);
-    inputField.setEnabled(!show);
-    
-    if (show)
-    {
-        addMessage("Thinking...", false);
-    }
-}
-
-//==============================================================================
-void ChatComponent::drawMessage(juce::Graphics& g, const ChatMessage& message, int y, int width)
-{
-    int padding = 10;
-    int cornerRadius = 8;
-    
-    juce::Colour bgColour = message.isUser ? juce::Colour(0xff4a9eff) : juce::Colour(0xff2a2a2a);
-    juce::Colour textColour = juce::Colour(0xffffffff);
-    
-    juce::Rectangle<int> messageRect;
-    if (message.isUser)
-    {
-        messageRect = juce::Rectangle<int>(width - 200, y, 190, calculateMessageHeight(message, width));
-    }
-    else
-    {
-        messageRect = juce::Rectangle<int>(10, y, width - 220, calculateMessageHeight(message, width));
-    }
-    
-    g.setColour(bgColour);
-    g.fillRoundedRectangle(messageRect.toFloat(), cornerRadius);
-    
-    g.setColour(textColour);
-    g.setFont(juce::Font(juce::FontOptions(14.0f)));
-    g.drawText(message.text, messageRect.reduced(padding), juce::Justification::topLeft, true);
-}
-
-//==============================================================================
-int ChatComponent::calculateMessageHeight(const ChatMessage& message, int width)
-{
-    int maxWidth = message.isUser ? 190 : (width - 220);
-    juce::Font font(juce::FontOptions(14.0f));
-    // Use a simple approximation: average character width * text length
-    // This is a rough estimate since getStringWidth is deprecated
-    int estimatedWidth = static_cast<int>(message.text.length() * 8.5f); // Approximate char width
-    int numLines = (estimatedWidth / maxWidth) + 1;
-    return (numLines * 20) + 20; // 20px per line + padding
-}
-
-//==============================================================================
-void ChatComponent::LLMThread::run()
-{
-    if (owner == nullptr || owner->llmService == nullptr)
-        return;
-    
-    if (requestType == 0) // Beat generation
-    {
-        auto result = owner->llmService->generateBeat(prompt);
-        
-        juce::MessageManager::callAsync([this, result]()
-        {
-            if (owner == nullptr) return;
-            
-            owner->showLoading(false);
-            
-            if (result.success)
-            {
-                if (owner->sessionState != nullptr)
-                {
-                    owner->sessionState->updateFromBeatData(result.beatData);
-                }
-                else
-                {
-                    owner->addMessage("Beat generated, but session state not available.", false);
-                }
-            }
-            else
-            {
-                owner->showError(result.errorMessage);
-            }
-        });
-    }
-    else if (requestType == 1) // Component adjustment
-    {
-        auto result = owner->llmService->adjustComponent(componentName, adjustment, currentBeat);
-        
-        juce::MessageManager::callAsync([this, result]()
-        {
-            if (owner == nullptr) return;
-            
-            owner->showLoading(false);
-            
-            if (result.success)
-            {
-                if (owner->sessionState != nullptr)
-                {
-                    owner->sessionState->updateComponent(componentName, result.componentData);
-                }
-                else
-                {
-                    owner->addMessage("Component adjusted, but session state not available.", false);
-                }
-            }
-            else
-            {
-                owner->showError(result.errorMessage);
-            }
-        });
-    }
-    else if (requestType == 2) // General chat
-    {
-        auto result = owner->llmService->chat(prompt, owner->conversationHistory);
-        
-        juce::MessageManager::callAsync([this, result]()
-        {
-            if (owner == nullptr) return;
-            
-            owner->showLoading(false);
-            
-            if (result.success)
-            {
-                owner->addMessage(result.message, false);
-            }
-            else
-            {
-                owner->showError(result.errorMessage);
-            }
-        });
-    }
-}
-
